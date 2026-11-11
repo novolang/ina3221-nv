@@ -1,0 +1,40 @@
+// ina3221_async — the awaitable form of an INA3221 measurement, for a host
+// scheduler.
+//
+// A triggered conversion of the enabled channels takes microseconds to
+// milliseconds, and the part has no pin that signals its end.  The awaitable
+// form starts the conversion, parks the task for the time `convert_start`
+// answers, rounded up to a whole millisecond, and then reads the channel.
+// While the task is parked the scheduler runs the others.
+//
+// An `async fn` cannot take a `@value` struct (E2015), and `Ina3221` is one,
+// so the type here is a plain struct that holds a port and the resistances.
+// An `async fn` is refused at the embedded tier, so the method is
+// `@tier(app)`; a device program waits the time `mon_start` answers.
+
+use dev_power.{ MilliVolts }
+use dev_current.{ MonReading, CurrentMonitorAsync }
+use ina3221
+use ina3221.{ Ina3221Port }
+
+// An INA3221 behind a port, with the shunt resistance of each channel in
+// micro-ohms, whose measurement is awaited.  It is built over any
+// `Ina3221Port`: a board's `Ina3221I2c`, or a test's double.
+pub struct Ina3221Timed<P: Ina3221Port>
+    port: P
+    shunt0: Int
+    shunt1: Int
+    shunt2: Int
+
+impl CurrentMonitorAsync[hw, time, async] for Ina3221Timed
+    // Starts a triggered conversion, parks the task for its length, and
+    // answers the measurement of channel `ch`.  `None` when no channel is
+    // enabled, when the part did not answer, and for a channel the board
+    // does not use.
+    @tier(app)
+    async fn mon_measure(self, ch: Int) -> ?MonReading [hw, time, async]
+        let us = ina3221.convert_start(self.port)
+        if us < 0
+            return None
+        core.rt.sleep_ms((us + 999) / 1000)
+        ina3221.reading_of(self.port, ch, ina3221.shunt_of(self.shunt0, self.shunt1, self.shunt2, ch))

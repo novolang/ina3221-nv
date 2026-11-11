@@ -1,0 +1,34 @@
+[package]
+name        = "ina3221-nv"
+version     = "0.1.0"
+description = "A driver for Texas Instruments' INA3221 three-channel current and voltage monitor on an I2C bus: the configuration (channel enables, averaging, bus and shunt conversion times, mode), the shunt and bus voltage of each channel and the current from the shunt resistance given at attach, the critical and warning alert limits of each channel, the shunt-voltage sum and its limit, the alert flags, the power-valid limits, and the manufacturer and die ID check, as devices-nv's CurrentMonitor for three channels and Identifiable."
+license     = "Apache-2.0"
+stability   = "experimental"
+category    = "embedded"
+layer       = "host"
+tags        = ["ina3221", "ina219", "current", "power", "voltage", "monitor", "shunt", "i2c", "sensor", "nrf52840-dk", "nrf54lm20-dk"]
+repository  = "https://github.com/novolang/ina3221-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.24.1"
+
+# Every module of the package checks at the embedded tier, so a program
+# of any tier, embedded, rt or system, may call it.
+[tier]
+tier = "embedded"
+
+# The device program, examples/rail_monitor.nv, has no [[bin]] entry: an
+# entry makes the registry list the package as a program, and a library
+# with an entry would be built by `novo install` for the host.
+# tests/device_build.sh builds the program for two boards as the main of
+# a scratch package that depends on this one.
+
+[docs.pages]
+"README.md" = "Reading an INA3221 three-channel current monitor from a device program"
+
+[dependencies]
+# The board's I2C bus and GPIO handles, and the I2cBus and GpioOut traits
+# they implement.
+embedded-hal-nv = "^0.3.3"
+# The wiring record a board's device table hands `attach`, the register
+# helpers, and the CurrentMonitor trait.
+devices-nv      = "^0.3.3"

@@ -1,0 +1,88 @@
+/* rail_monitor.nv: a reading loop for an INA3221 on a breakout, for an nRF52840
+ * DK or an nRF54LM20 DK
+ *
+ * Build:  bash tests/device_build.sh   (the package's own script)
+ *          or make this file the main of a package that depends on
+ *          ina3221-nv and run
+ *              novo build --target=nrf52840-dk src/main.nv
+ * Run:    probe-rs run --chip nRF52840_xxAA main.elf
+ *
+ * NOT a `novo run` program: it targets a board and never ends.
+ *
+ * The breakout's SDA and SCL go to the board's I2C pins and its A0 pin to
+ * ground, which puts the part at 0x40.  Channel 1 and channel 2 carry a
+ * load each through the breakout's shunt, a 0.1 ohm resistor; channel 3 is
+ * not used.  The program brings the part up, which checks its manufacturer
+ * and die ID and resets it, takes the two shunts into use with the largest
+ * current each load is expected to draw, 800 mA (80 mV across the shunt,
+ * under the 163.8 mV the part measures), and once a second prints one line
+ * per rail over RTT:
+ *
+ *     ina3221 ch=0 mV=5012 uA=41250 uW=206745
+ *
+ * A current that flows from the supply side to the load side is positive.
+ *
+ * Effects the program declares: [hw], for the I2C bus, the UART and the
+ * timer.
+ *
+ * Boards: the nRF52840 DK drives I2C with TWIM0 (SDA P0.26, SCL P0.27) and
+ * the nRF54LM20 DK with TWIM22 (SDA P1.03, SCL P1.04).  With no part on the
+ * bus the program prints "ina3221: no answer".  The part has not been read
+ * on a board.
+ */
+use embedded_hal.{ BoardI2c, BoardGpio }
+use dev_bus
+use dev_current.{ CurrentMonitor }
+use ina3221.{ Ina3221 }
+
+// The part's address with A0 at ground.
+const ADDR = 0x40
+
+// The breakout's shunt resistor in micro-ohms, and the largest current the
+// program expects on a rail in microamps.
+const SHUNT_UOHM = 100000
+const MAX_UA = 800000
+
+// A label and a number, written without building a string.
+@tier(embedded)
+fn field(label: Str, v: Int) [hw]
+    hal.uart.write(label)
+    hal.uart.write(str.from_int(v))
+
+// One line for channel `ch`, or the reason there is none.
+@tier(embedded)
+fn report(part: Ina3221, ch: Int) [hw]
+    match part.mon_read(ch)
+        Some(r) =>
+            hal.uart.write("ina3221")
+            field(" ch=", ch)
+            field(" mV=", r.bus.mv)
+            field(" uA=", r.current.ua)
+            field(" uW=", r.power.uw)
+            hal.uart.write("\n")
+        None    =>
+            hal.uart.write("ina3221: no result\n")
+
+@tier(embedded)
+fn main() [hw]
+    let part = Ina3221.attach(BoardI2c { id: 0 }, BoardGpio { id: 0 }, dev_bus.wiring_i2c(0, ADDR),
+                              SHUNT_UOHM, SHUNT_UOHM, 0)
+    if not part.begin()
+        hal.uart.write("ina3221: no answer\n")
+        return
+    if not part.mon_set_shunt(0, SHUNT_UOHM, MAX_UA) or not part.mon_set_shunt(1, SHUNT_UOHM, MAX_UA)
+        hal.uart.write("ina3221: shunt refused\n")
+        return
+    // Channel 3 is not wired; leaving it out of the pass shortens it.
+    if not part.set_channel(2, false)
+        hal.uart.write("ina3221: channel refused\n")
+        return
+    loop
+        // The part converts continuously, so the wait is 0; a part set to
+        // a triggered mode answers the time of the conversion.
+        let us = part.mon_start()
+        if us > 0
+            hal.timer.delay_us(us)
+        report(part, 0)
+        report(part, 1)
+        hal.timer.delay_ms(1000)

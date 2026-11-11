@@ -1,0 +1,1245 @@
+// ina3221_tests — the driver over a double of the part: a register file on
+// an I2C bus that answers at 0x40 the way Texas Instruments' data sheet
+// (SBOS576C, September 2026) says an INA3221 does, with its power-on
+// values, its read-only registers, limit registers that keep the bits the
+// sheet gives them, a Mask/Enable register whose flags clear when it is
+// read, and a read that answers one register and nothing longer, since the
+// sheet defines no more, so the framing, the settings and the readings are
+// checked on the host, one transaction at a time.  The log keeps what the
+// controller sent, in a form the tests compare.
+//
+// Log entries: a write is 1, the address, the bytes sent, -1; a read is 2,
+// the address, the register, the count, -1.
+//
+// The numbers are the sheet's own where it gives one, and otherwise
+// worked out here by hand.  The sheet's example: -80 mV across a shunt is
+// 2000 steps of 40 uV, 011 1110 1000 0 in the upper 13 bits, complemented
+// and incremented to 0xC180.  A 5 V rail through a 0.1 ohm shunt carrying
+// 50 mA drops 5 mV, 125 steps, and the register holds 125 << 3 = 1000 =
+// 0x03E8; the bus voltage of 5 V is 625 steps of 8 mV, 625 << 3 = 5000 =
+// 0x1388; the current is 5000 uV over 0.1 ohm, 50000 uA, and the power
+// 5000 mV times 50000 uA over 1000, 250000 uW.
+
+use std.test
+use embedded_hal.{ BoardI2c, BoardGpio, I2cBus, GpioOut }
+use dev_bus.{ DeviceWiring, DevBytes }
+use dev_power.{ MilliVolts }
+use dev_current.{ MicroVolts, MicroAmps, MicroWatts, MonReading, CurrentMonitor, CurrentMonitorAsync }
+use dev_id.{ DeviceId, Identifiable }
+use ina3221
+use ina3221.{ Ina3221, Ina3221Config, Ina3221Flags, Ina3221Alert, Ina3221Port }
+use ina3221_async.{ Ina3221Timed }
+
+// ── The double ───────────────────────────────────────────────────────
+//
+// `regs` is the register file by register number, 16 bits each.  `ro`
+// lists registers that ignore a write.  `st` is the double's state: 4 is 1
+// when a part is there, 5 the address it answers at, 22 the I2C clock, 41
+// the reads that still answer (-1 for all), 42 the writes that are still
+// acknowledged (-1 for all), 43 is 1 when a reset leaves the registers as
+// they are, 50 the flags Mask/Enable will show once, 60 the resets seen,
+// 99 the entries in the log.
+
+struct Chip
+    regs: HashMap<Int, Int>
+    ro: HashMap<Int, Int>
+    st: HashMap<Int, Int>
+    log: HashMap<Int, Int>
+
+fn at(m: HashMap<Int, Int>, k: Int) -> Int
+    m.get(k) ?? 0
+
+// The registers at their power-on values (Table 8-1).
+fn power_on(c: Chip)
+    c.regs.insert(0x00, 0x7127)
+    for r in 0x07..0x0D
+        c.regs.insert(r, 0x7FF8)
+    c.regs.insert(0x0E, 0x7FFE)
+    c.regs.insert(0x0F, 0x0002)
+    c.regs.insert(0x10, 0x2710)
+    c.regs.insert(0x11, 0x2328)
+    for r in 0x01..0x07
+        c.regs.insert(r, 0)
+    c.regs.insert(0x0D, 0)
+
+// The part at power-up, with the manufacturer ID 0x5449 and the die ID
+// 0x3220.
+fn chip() -> Chip
+    let c = Chip { regs: HashMap.new(), ro: HashMap.new(), st: HashMap.new(), log: HashMap.new() }
+    power_on(c)
+    c.regs.insert(0xFE, 0x5449)
+    c.regs.insert(0xFF, 0x3220)
+    c.st.insert(4, 1)
+    c.st.insert(5, 0x40)
+    c.st.insert(41, -1)
+    c.st.insert(42, -1)
+    c
+
+// Appends a value to the log.
+fn log_push(c: Chip, v: Int)
+    let n = at(c.st, 99)
+    c.log.insert(n, v)
+    c.st.insert(99, n + 1)
+
+// Empties the log.
+fn log_clear(c: Chip)
+    c.st.insert(99, 0)
+
+// The power-on reset: every register returns to its power-on value unless
+// the double was told to ignore the reset.
+fn reset_regs(c: Chip)
+    c.st.insert(60, at(c.st, 60) + 1)
+    if at(c.st, 43) == 1
+        return
+    power_on(c)
+
+// The 16-bit value the part answers at `reg`.  Reading Mask/Enable shows the
+// flags that came up since the last read and clears the flags that clear on
+// a read: the critical, summation and warning flags and Conversion Ready.
+// The power-valid and timing-control flags stay.
+fn chip_reg(c: Chip, reg: Int) -> Int
+    if reg == 0x0F
+        let v = at(c.regs, 0x0F) | at(c.st, 50)
+        c.st.insert(50, 0)
+        return v
+    at(c.regs, reg)
+
+// A write to one register: a read-only register or one the test froze
+// ignores it; CONFIG resets on bit 15 and keeps the other fifteen bits, and
+// a triggered mode raises Conversion Ready at once; the limit registers keep
+// the bits the sheet gives them; Mask/Enable keeps the six configuration
+// bits and the two flags that stay.  The shunt, bus, sum and ID registers
+// are read-only.
+fn chip_write(c: Chip, reg: Int, v: Int)
+    if at(c.ro, reg) == 1
+        return
+    if reg == 0x00
+        if (v & 0x8000) != 0
+            reset_regs(c)
+            return
+        c.regs.insert(0x00, v & 0x7FFF)
+        let m = v & 7
+        if m >= 1 and m <= 3
+            c.st.insert(50, at(c.st, 50) | 0x0001)
+        return
+    if reg >= 0x07 and reg <= 0x0C
+        c.regs.insert(reg, v & 0xFFF8)
+    if reg == 0x0E
+        c.regs.insert(0x0E, v & 0xFFFE)
+    if reg == 0x0F
+        c.regs.insert(0x0F, (v & 0x7C00) | (at(c.regs, 0x0F) & 0x0006))
+    if reg == 0x10 or reg == 0x11
+        c.regs.insert(reg, v & 0x7FF8)
+
+struct FakeI2c
+    c: Chip
+
+impl I2cBus for FakeI2c
+    fn init(self, freq: Int) [hw]
+        self.c.st.insert(22, freq)
+
+    fn write(self, addr: Int, data: [u8]) -> Bool [hw]
+        log_push(self.c, 1)
+        log_push(self.c, addr)
+        for b in data
+            log_push(self.c, b as Int)
+        log_push(self.c, -1)
+        if addr != at(self.c.st, 5) or at(self.c.st, 4) == 0 or data.len() != 3
+            return false
+        let left = at(self.c.st, 42)
+        if left == 0
+            return false
+        if left > 0
+            self.c.st.insert(42, left - 1)
+        chip_write(self.c, data[0] as Int, (data[1] as Int << 8) | data[2] as Int)
+        true
+
+    fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
+        None
+
+    // A read answers one register, two bytes.  The sheet defines no read
+    // that runs on into the next register, so the double refuses one.
+    @tier(app)
+    fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
+        log_push(self.c, 2)
+        log_push(self.c, addr)
+        log_push(self.c, tx[0] as Int)
+        log_push(self.c, n)
+        log_push(self.c, -1)
+        if addr != at(self.c.st, 5) or at(self.c.st, 4) == 0 or n != 2
+            return None
+        let left = at(self.c.st, 41)
+        if left == 0
+            return None
+        if left > 0
+            self.c.st.insert(41, left - 1)
+        let v = chip_reg(self.c, tx[0] as Int)
+        var out: [u8] = []
+        list.push(out, ((v >> 8) & 0xFF) as u8)
+        list.push(out, (v & 0xFF) as u8)
+        Some(out)
+
+// The GPIO double records the level and the mode of each pin.
+struct FakePins
+    levels: HashMap<Int, Int>
+    modes: HashMap<Int, Int>
+
+impl GpioOut for FakePins
+    fn mode(self, pin: Int, dir: Int) [hw]
+        self.modes.insert(pin, dir)
+
+    fn set(self, pin: Int, val: Int) [hw]
+        self.levels.insert(pin, val)
+
+    fn get(self, pin: Int) -> Int [hw]
+        at(self.levels, pin)
+
+@tier(app)
+fn pins() -> FakePins
+    FakePins { levels: HashMap.new(), modes: HashMap.new() }
+
+// The port, as a type that holds a bus implements it: every method is the
+// package's own function over the double.
+struct Dut
+    bus: FakeI2c
+    pins: FakePins
+    w: DeviceWiring
+
+impl Ina3221Port for Dut
+    fn setup(self) -> Bool [hw]
+        ina3221.i2c_setup(self.bus, self.pins, self.w)
+
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        ina3221.i2c_read_into(self.bus, self.w, reg, n, var dst)
+
+    fn write_regs(self, reg: Int, src: DevBytes) -> Bool [hw]
+        ina3221.i2c_write(self.bus, self.w, reg, src)
+
+    fn alert_level(self) -> Int [hw]
+        ina3221.alert_level_of(self.pins, self.w)
+
+// The board's wiring: the part at 0x40, the Critical pin on pin 9.
+fn wiring() -> DeviceWiring
+    dev_bus.wiring_irq(dev_bus.wiring_i2c(0, 0x40), 9)
+
+fn dut(c: Chip) -> Dut
+    Dut { bus: FakeI2c { c: c }, pins: pins(), w: wiring() }
+
+// Asserts the log holds exactly `want`, then empties it.
+fn log_is(c: Chip, want: [Int])
+    test.assert_eq(at(c.st, 99), want.len())
+    for i in 0..want.len()
+        test.assert_eq(at(c.log, i), want[i])
+    log_clear(c)
+
+fn int_or(o: ?Int) -> Int
+    match o
+        Some(v) => v
+        None    => -999999
+
+fn config_or(o: ?Ina3221Config) -> Ina3221Config
+    match o
+        Some(c) => c
+        None    => Ina3221Config { channels: -1, avg: -1, vbus_ct: -1, vshunt_ct: -1, mode: -1 }
+
+fn mv_or(o: ?MilliVolts) -> Int
+    match o
+        Some(v) => v.mv
+        None    => -999999
+
+fn uv_or(o: ?MicroVolts) -> Int
+    match o
+        Some(v) => v.uv
+        None    => -999999
+
+fn reading_or(o: ?MonReading) -> MonReading
+    match o
+        Some(r) => r
+        None    => MonReading { bus: MilliVolts { mv: -1 }, shunt: MicroVolts { uv: -1 },
+                                current: MicroAmps { ua: -1 }, power: MicroWatts { uw: -1 }, overflow: false }
+
+fn flags_or(o: ?Ina3221Flags) -> Ina3221Flags
+    match o
+        Some(f) => f
+        None    => Ina3221Flags { critical: -1, warning: -1, sum: false, power_valid: false, timing: false,
+                                  ready: false }
+
+// A 5 V rail on channel 0 through 0.1 ohm carrying 50 mA.
+fn rail(c: Chip)
+    c.regs.insert(0x01, 0x03E8)
+    c.regs.insert(0x02, 0x1388)
+
+// ── The constants and the tables ─────────────────────────────────────
+
+@test
+fn test_the_constants_are_the_data_sheets() [io, hw]
+    test.assert_eq(ina3221.MANUFACTURER_ID, 0x5449)
+    test.assert_eq(ina3221.DIE_ID, 0x3220)
+    test.assert_eq(ina3221.CONFIG_POR, 0x7127)
+    test.assert_eq(ina3221.MASK_POR, 0x0002)
+    test.assert_eq(ina3221.SHUNT_FULL_SCALE_UV, 163800)
+    test.assert_eq(ina3221.SHUNT_FLOOR_UV, -163840)
+    test.assert_eq(ina3221.MODE_POWER_DOWN, 0)
+    test.assert_eq(ina3221.MODE_SHUNT_TRIGGERED, 1)
+    test.assert_eq(ina3221.MODE_BUS_TRIGGERED, 2)
+    test.assert_eq(ina3221.MODE_BOTH_TRIGGERED, 3)
+    test.assert_eq(ina3221.MODE_SHUNT_CONTINUOUS, 5)
+    test.assert_eq(ina3221.MODE_BUS_CONTINUOUS, 6)
+    test.assert_eq(ina3221.MODE_BOTH_CONTINUOUS, 7)
+
+@test
+fn test_the_averages_follow_table_8_4() [io, hw]
+    test.assert_eq(ina3221.averages_of(0), 1)
+    test.assert_eq(ina3221.averages_of(1), 4)
+    test.assert_eq(ina3221.averages_of(2), 16)
+    test.assert_eq(ina3221.averages_of(3), 64)
+    test.assert_eq(ina3221.averages_of(4), 128)
+    test.assert_eq(ina3221.averages_of(5), 256)
+    test.assert_eq(ina3221.averages_of(6), 512)
+    test.assert_eq(ina3221.averages_of(7), 1024)
+    test.assert_eq(ina3221.averages_of(8), 0)
+    test.assert_eq(ina3221.averages_of(-1), 0)
+
+@test
+fn test_the_conversion_times_follow_table_8_4() [io, hw]
+    test.assert_eq(ina3221.conversion_time_us(0), 140)
+    test.assert_eq(ina3221.conversion_time_us(1), 204)
+    test.assert_eq(ina3221.conversion_time_us(2), 332)
+    test.assert_eq(ina3221.conversion_time_us(3), 588)
+    test.assert_eq(ina3221.conversion_time_us(4), 1100)
+    test.assert_eq(ina3221.conversion_time_us(5), 2116)
+    test.assert_eq(ina3221.conversion_time_us(6), 4156)
+    test.assert_eq(ina3221.conversion_time_us(7), 8244)
+    test.assert_eq(ina3221.conversion_time_us(8), -1)
+    test.assert_eq(ina3221.conversion_time_us(-1), -1)
+
+@test
+fn test_the_power_on_config_has_three_channels_continuous_at_1_1_ms() [io, hw]
+    let c = ina3221.config_of(0x7127)
+    test.assert_eq(c.channels, 7)
+    test.assert_eq(c.avg, 0)
+    test.assert_eq(c.vbus_ct, 4)
+    test.assert_eq(c.vshunt_ct, 4)
+    test.assert_eq(c.mode, 7)
+    test.assert_eq(ina3221.config_bits(c), 0x7127)
+    // The channel bits: channel 0 is bit 14, channel 2 bit 12.
+    test.assert_eq(ina3221.config_of(0x4000).channels, 1)
+    test.assert_eq(ina3221.config_of(0x2000).channels, 2)
+    test.assert_eq(ina3221.config_of(0x1000).channels, 4)
+    test.assert_eq(ina3221.config_bits(Ina3221Config { channels: 1, avg: 0, vbus_ct: 0, vshunt_ct: 0, mode: 0 }),
+        0x4000)
+    test.assert_eq(ina3221.config_bits(Ina3221Config { channels: 2, avg: 0, vbus_ct: 0, vshunt_ct: 0, mode: 0 }),
+        0x2000)
+    test.assert_eq(ina3221.config_bits(Ina3221Config { channels: 4, avg: 0, vbus_ct: 0, vshunt_ct: 0, mode: 0 }),
+        0x1000)
+    // The reset bit is not a field.
+    let d = Ina3221Config { channels: 7, avg: 7, vbus_ct: 7, vshunt_ct: 7, mode: 7 }
+    test.assert_eq(ina3221.config_bits(d), 0x7FFF)
+
+@test
+fn test_the_time_of_a_pass_follows_the_channels_and_the_mode() [io, hw]
+    // The sheet's power-on settings: 3 channels, 1.1 ms for each signal,
+    // 2.2 ms a channel, 6.6 ms.
+    test.assert_eq(ina3221.cycle_us(ina3221.config_of(0x7127)), 6600)
+    // Three channels, 16 averages of 588 us and 332 us: 3 * 16 * 920.
+    test.assert_eq(ina3221.cycle_us(Ina3221Config { channels: 7, avg: 2, vbus_ct: 3, vshunt_ct: 2, mode: 3 }),
+        44160)
+    // One channel.
+    test.assert_eq(ina3221.cycle_us(Ina3221Config { channels: 2, avg: 2, vbus_ct: 3, vshunt_ct: 2, mode: 3 }),
+        14720)
+    // The shunt alone, the bus alone, and power-down.
+    test.assert_eq(ina3221.cycle_us(Ina3221Config { channels: 3, avg: 1, vbus_ct: 3, vshunt_ct: 2, mode: 1 }),
+        2656)
+    test.assert_eq(ina3221.cycle_us(Ina3221Config { channels: 3, avg: 1, vbus_ct: 3, vshunt_ct: 2, mode: 5 }),
+        2656)
+    test.assert_eq(ina3221.cycle_us(Ina3221Config { channels: 3, avg: 1, vbus_ct: 3, vshunt_ct: 2, mode: 2 }),
+        4704)
+    test.assert_eq(ina3221.cycle_us(Ina3221Config { channels: 3, avg: 1, vbus_ct: 3, vshunt_ct: 2, mode: 6 }),
+        4704)
+    test.assert_eq(ina3221.cycle_us(Ina3221Config { channels: 3, avg: 1, vbus_ct: 3, vshunt_ct: 2, mode: 0 }), 0)
+    test.assert_eq(ina3221.cycle_us(Ina3221Config { channels: 3, avg: 1, vbus_ct: 3, vshunt_ct: 2, mode: 4 }), 0)
+    // No channel enabled: nothing to convert.
+    test.assert_eq(ina3221.cycle_us(Ina3221Config { channels: 0, avg: 1, vbus_ct: 3, vshunt_ct: 2, mode: 3 }), 0)
+    // A field outside its range.
+    test.assert_eq(ina3221.cycle_us(Ina3221Config { channels: 7, avg: 8, vbus_ct: 3, vshunt_ct: 2, mode: 3 }), -1)
+    test.assert_eq(ina3221.cycle_us(Ina3221Config { channels: 7, avg: 1, vbus_ct: 8, vshunt_ct: 2, mode: 3 }), -1)
+    test.assert_eq(ina3221.cycle_us(Ina3221Config { channels: 7, avg: 1, vbus_ct: 3, vshunt_ct: 8, mode: 3 }), -1)
+    test.assert_eq(ina3221.cycle_us(Ina3221Config { channels: 7, avg: 1, vbus_ct: 3, vshunt_ct: 2, mode: 8 }), -1)
+    test.assert_eq(ina3221.cycle_us(Ina3221Config { channels: 7, avg: 1, vbus_ct: 3, vshunt_ct: 2, mode: -1 }),
+        -1)
+    test.assert_eq(ina3221.cycle_us(Ina3221Config { channels: 8, avg: 1, vbus_ct: 3, vshunt_ct: 2, mode: 3 }), -1)
+    test.assert_eq(ina3221.cycle_us(Ina3221Config { channels: -1, avg: 1, vbus_ct: 3, vshunt_ct: 2, mode: 3 }),
+        -1)
+
+@test
+fn test_only_modes_5_to_7_convert_by_themselves() [io, hw]
+    for m in 0..5
+        test.assert(not ina3221.mode_is_continuous(m))
+    test.assert(ina3221.mode_is_continuous(5))
+    test.assert(ina3221.mode_is_continuous(6))
+    test.assert(ina3221.mode_is_continuous(7))
+    test.assert(not ina3221.mode_is_continuous(8))
+
+@test
+fn test_the_channel_count_of_a_mask() [io, hw]
+    test.assert_eq(ina3221.channel_count(0), 0)
+    test.assert_eq(ina3221.channel_count(1), 1)
+    test.assert_eq(ina3221.channel_count(5), 2)
+    test.assert_eq(ina3221.channel_count(7), 3)
+
+@test
+fn test_the_address_follows_table_7_1() [io, hw]
+    test.assert_eq(ina3221.address_of(0), 0x40)
+    test.assert_eq(ina3221.address_of(1), 0x41)
+    test.assert_eq(ina3221.address_of(2), 0x42)
+    test.assert_eq(ina3221.address_of(3), 0x43)
+    test.assert_eq(ina3221.address_of(4), -1)
+    test.assert_eq(ina3221.address_of(-1), -1)
+
+// ── The conversions ──────────────────────────────────────────────────
+
+@test
+fn test_the_registers_mean_what_the_data_sheet_says() [io, hw]
+    // The sheet's example, Section 8.2.2: -80 mV is 0xC180.
+    test.assert_eq(ina3221.shunt_uv_of(0xC180), -80000)
+    // Full scale is 0x7FF8, 163.8 mV; one step is 40 uV.
+    test.assert_eq(ina3221.shunt_uv_of(0x7FF8), 163800)
+    test.assert_eq(ina3221.shunt_uv_of(0x0008), 40)
+    test.assert_eq(ina3221.shunt_uv_of(0x0000), 0)
+    // The most negative value, 0x8000, is -4096 steps.
+    test.assert_eq(ina3221.shunt_uv_of(0x8000), -163840)
+    // The three reserved bits are ignored.
+    test.assert_eq(ina3221.shunt_uv_of(0x0007), 0)
+    // 125 steps of 40 uV is 5 mV.
+    test.assert_eq(ina3221.shunt_uv_of(0x03E8), 5000)
+    // The bus voltage: 8 mV a step, 0x7FF8 is 32.76 V, 5 V is 0x1388.
+    test.assert_eq(ina3221.bus_mv_of(0x7FF8), 32760)
+    test.assert_eq(ina3221.bus_mv_of(0x1388), 5000)
+    test.assert_eq(ina3221.bus_mv_of(0x2EE0), 12000)
+    test.assert_eq(ina3221.bus_mv_of(0x0008), 8)
+    test.assert_eq(ina3221.bus_mv_of(0xFFF8), -8)
+
+@test
+fn test_the_sum_register_has_its_sign_at_bit_15_and_its_lsb_at_bit_1() [io, hw]
+    test.assert_eq(ina3221.sum_uv_of(0x0002), 40)
+    // 1000 steps of 40 uV is 40 mV, 1000 << 1 = 2000 = 0x07D0.
+    test.assert_eq(ina3221.sum_uv_of(0x07D0), 40000)
+    // -1 step is 0xFFFE.
+    test.assert_eq(ina3221.sum_uv_of(0xFFFE), -40)
+    test.assert_eq(ina3221.sum_uv_of(0x7FFE), 655320)
+    test.assert_eq(ina3221.sum_uv_of(0x8000), -655360)
+
+@test
+fn test_a_shunt_register_at_either_end_has_saturated() [io, hw]
+    test.assert(ina3221.shunt_saturated(0x7FF8))
+    test.assert(ina3221.shunt_saturated(0x8000))
+    test.assert(not ina3221.shunt_saturated(0x7FF0))
+    test.assert(not ina3221.shunt_saturated(0x8008))
+    test.assert(not ina3221.shunt_saturated(0x0000))
+
+@test
+fn test_the_flags_of_mask_enable_number_the_channels_downward() [io, hw]
+    let none = ina3221.flags_of(0x0000)
+    test.assert_eq(none.critical, 0)
+    test.assert_eq(none.warning, 0)
+    test.assert(not none.sum)
+    test.assert(not none.power_valid)
+    test.assert(not none.timing)
+    test.assert(not none.ready)
+    // CF1 is bit 9, CF2 bit 8, CF3 bit 7 (Table 8-33).
+    test.assert_eq(ina3221.flags_of(0x0200).critical, 1)
+    test.assert_eq(ina3221.flags_of(0x0100).critical, 2)
+    test.assert_eq(ina3221.flags_of(0x0080).critical, 4)
+    // WF1 is bit 5, WF2 bit 4, WF3 bit 3.
+    test.assert_eq(ina3221.flags_of(0x0020).warning, 1)
+    test.assert_eq(ina3221.flags_of(0x0010).warning, 2)
+    test.assert_eq(ina3221.flags_of(0x0008).warning, 4)
+    test.assert(ina3221.flags_of(0x0040).sum)
+    test.assert(ina3221.flags_of(0x0004).power_valid)
+    test.assert(ina3221.flags_of(0x0002).timing)
+    test.assert(ina3221.flags_of(0x0001).ready)
+    // The configuration bits are not flags.
+    let cfg = ina3221.flags_of(0x7C00)
+    test.assert_eq(cfg.critical, 0)
+    test.assert_eq(cfg.warning, 0)
+    test.assert(not cfg.sum)
+    test.assert(not cfg.ready)
+    // A reading with a flag of every kind set.
+    let all = ina3221.flags_of(0x03FF)
+    test.assert_eq(all.critical, 7)
+    test.assert_eq(all.warning, 7)
+    test.assert(all.sum)
+    test.assert(all.power_valid)
+    test.assert(all.timing)
+    test.assert(all.ready)
+
+@test
+fn test_the_limits_are_in_the_registers_steps() [io, hw]
+    test.assert_eq(ina3221.shunt_limit_raw(80000), 0x3E80)
+    test.assert_eq(ina3221.shunt_limit_raw(-80000), 0xC180)
+    test.assert_eq(ina3221.shunt_limit_raw(163800), 0x7FF8)
+    test.assert_eq(ina3221.shunt_limit_raw(-163840), 0x8000)
+    // Truncated toward zero: 79 uV is 1 step.
+    test.assert_eq(ina3221.shunt_limit_raw(79), 0x0008)
+    test.assert_eq(ina3221.sum_limit_raw(40000), 0x07D0)
+    test.assert_eq(ina3221.sum_limit_raw(-40), 0xFFFE)
+    test.assert_eq(ina3221.pv_limit_raw(10000), 0x2710)
+    test.assert_eq(ina3221.pv_limit_raw(9000), 0x2328)
+    test.assert_eq(ina3221.pv_limit_raw(32760), 0x7FF8)
+    test.assert(ina3221.shunt_limit_fits(163800))
+    test.assert(ina3221.shunt_limit_fits(-163840))
+    test.assert(not ina3221.shunt_limit_fits(163801))
+    test.assert(not ina3221.shunt_limit_fits(-163841))
+    test.assert(ina3221.sum_limit_fits(655320))
+    test.assert(ina3221.sum_limit_fits(-655360))
+    test.assert(not ina3221.sum_limit_fits(655321))
+    test.assert(not ina3221.sum_limit_fits(-655361))
+    test.assert(ina3221.pv_limit_fits(0))
+    test.assert(ina3221.pv_limit_fits(32760))
+    test.assert(not ina3221.pv_limit_fits(32761))
+    test.assert(not ina3221.pv_limit_fits(-1))
+
+@test
+fn test_the_alert_bits_number_the_summation_channels_downward() [io, hw]
+    test.assert_eq(ina3221.alert_bits(Ina3221Alert { sum_channels: 0, warning_latch: false, critical_latch: false }),
+        0)
+    test.assert_eq(ina3221.alert_bits(Ina3221Alert { sum_channels: 1, warning_latch: false, critical_latch: false }),
+        0x4000)
+    test.assert_eq(ina3221.alert_bits(Ina3221Alert { sum_channels: 2, warning_latch: false, critical_latch: false }),
+        0x2000)
+    test.assert_eq(ina3221.alert_bits(Ina3221Alert { sum_channels: 4, warning_latch: false, critical_latch: false }),
+        0x1000)
+    test.assert_eq(ina3221.alert_bits(Ina3221Alert { sum_channels: 0, warning_latch: true, critical_latch: false }),
+        0x0800)
+    test.assert_eq(ina3221.alert_bits(Ina3221Alert { sum_channels: 0, warning_latch: false, critical_latch: true }),
+        0x0400)
+    test.assert_eq(ina3221.alert_bits(Ina3221Alert { sum_channels: 7, warning_latch: true, critical_latch: true }),
+        0x7C00)
+
+// ── The bus ──────────────────────────────────────────────────────────
+
+@test
+fn test_a_read_is_the_pointer_then_a_repeated_start_and_two_bytes() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert_eq(int_or(ina3221.reg_read(d, 0xFE)), 0x5449)
+    log_is(c, [2, 0x40, 0xFE, 2, -1])
+
+@test
+fn test_a_write_is_the_pointer_then_the_high_byte_then_the_low() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(ina3221.reg_write(d, 0x0E, 0x1234))
+    log_is(c, [1, 0x40, 0x0E, 0x12, 0x34, -1])
+    test.assert_eq(at(c.regs, 0x0E), 0x1234)
+
+@test
+fn test_a_set_register_is_read_back_under_a_mask() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(ina3221.reg_set(d, 0x10, 0x2710, 0x7FF8))
+    log_is(c, [1, 0x40, 0x10, 0x27, 0x10, -1, 2, 0x40, 0x10, 2, -1])
+    // A register that ignores the write differs from what was written.
+    c.ro.insert(0x10, 1)
+    test.assert(not ina3221.reg_set(d, 0x10, 0x1110, 0x7FF8))
+    // Bits outside the mask are not compared: the register holds 0x2710.
+    test.assert(ina3221.reg_set(d, 0x10, 0x2718, 0x7FF0))
+    test.assert(not ina3221.reg_set(d, 0x10, 0x2718, 0x7FF8))
+    c.ro.insert(0x10, 0)
+    // A write the part refuses, and a read-back it does not answer.
+    c.st.insert(42, 0)
+    test.assert(not ina3221.reg_set(d, 0x10, 0x2220, 0x7FF8))
+    c.st.insert(42, 1)
+    c.st.insert(41, 0)
+    test.assert(not ina3221.reg_set(d, 0x10, 0x2220, 0x7FF8))
+
+@test
+fn test_a_read_longer_than_one_register_is_not_something_the_part_defines() [io, hw]
+    // The double refuses it, which is why the driver never makes one.
+    let c = chip()
+    let d = dut(c)
+    var b: DevBytes = Vec.new()
+    test.assert(not d.read_regs(0x01, 4, var b))
+
+@test
+fn test_a_part_that_is_not_there_does_not_answer() [io, hw]
+    let c = chip()
+    c.st.insert(4, 0)
+    let d = dut(c)
+    test.assert(ina3221.reg_read(d, 0x00) == None)
+    test.assert(not ina3221.reg_write(d, 0x00, 1))
+    test.assert(ina3221.manufacturer_read(d) == None)
+    test.assert(ina3221.die_read(d) == None)
+    test.assert(ina3221.id_read(d) == None)
+    test.assert(ina3221.config_read(d) == None)
+    test.assert(ina3221.bus_read(d, 0) == None)
+    test.assert(ina3221.shunt_read(d, 0) == None)
+    test.assert(ina3221.reading_of(d, 0, 100000) == None)
+    test.assert(ina3221.critical_read(d, 0) == None)
+    test.assert(ina3221.warning_read(d, 0) == None)
+    test.assert(ina3221.sum_read(d) == None)
+    test.assert(ina3221.pv_upper_read(d) == None)
+    test.assert(ina3221.pv_lower_read(d) == None)
+    test.assert(ina3221.flags_read(d) == None)
+    test.assert(not ina3221.conversion_ready(d))
+    test.assert_eq(ina3221.convert_start(d), -1)
+    test.assert(not ina3221.start(d))
+    test.assert(not ina3221.channels_write(d, 1))
+    test.assert(not ina3221.channel_enable(d, 0, true))
+    test.assert(not ina3221.averaging_write(d, 1))
+    test.assert(not ina3221.conversion_times_write(d, 1, 1))
+    test.assert(not ina3221.mode_write(d, 3))
+
+@test
+fn test_the_part_answers_only_at_its_own_address() [io, hw]
+    let c = chip()
+    c.st.insert(5, 0x41)
+    let d = dut(c)
+    test.assert(ina3221.reg_read(d, 0x00) == None)
+    let e = Dut { bus: FakeI2c { c: c }, pins: pins(), w: dev_bus.wiring_i2c(0, 0x41) }
+    test.assert_eq(int_or(ina3221.reg_read(e, 0x00)), 0x7127)
+
+@test
+fn test_a_wiring_with_no_address_is_not_an_i2c_part() [io, hw]
+    let c = chip()
+    let d = Dut { bus: FakeI2c { c: c }, pins: pins(), w: dev_bus.wiring_spi(0, 5) }
+    test.assert(not d.setup())
+    var b: DevBytes = Vec.new()
+    test.assert(not d.read_regs(0x00, 2, var b))
+    test.assert(not ina3221.start(d))
+    test.assert_eq(at(c.st, 99), 0)
+
+@test
+fn test_setup_makes_the_critical_pin_an_input_and_the_bus_fast() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(d.setup())
+    test.assert_eq(at(c.st, 22), 400000)
+    test.assert_eq(at(d.pins.modes, 9), 0)
+    // A wiring with no alert pin touches no pin.
+    let e = Dut { bus: FakeI2c { c: c }, pins: pins(), w: dev_bus.wiring_i2c(0, 0x40) }
+    test.assert(e.setup())
+    test.assert_eq(e.pins.modes.len(), 0)
+
+@test
+fn test_the_critical_pin_level() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    d.pins.levels.insert(9, 1)
+    test.assert_eq(d.alert_level(), 1)
+    d.pins.levels.insert(9, 0)
+    test.assert_eq(d.alert_level(), 0)
+    test.assert_eq(ina3221.alert_level_of(d.pins, dev_bus.wiring_i2c(0, 0x40)), -1)
+
+// ── Identity and bring-up ────────────────────────────────────────────
+
+@test
+fn test_the_identity_is_the_manufacturer_and_the_die() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert_eq(int_or(ina3221.manufacturer_read(d)), 0x5449)
+    test.assert_eq(int_or(ina3221.die_read(d)), 0x3220)
+    match ina3221.id_read(d)
+        Some(i) =>
+            test.assert_eq(i.who, 0x3220)
+            test.assert(i.rev == None)
+        None    => test.assert(false)
+
+@test
+fn test_the_identity_matches_only_the_ina3221() [io, hw]
+    test.assert(ina3221.id_matches(0x5449, 0x3220))
+    test.assert(not ina3221.id_matches(0x5448, 0x3220))
+    test.assert(not ina3221.id_matches(0x5449, 0x3221))
+    test.assert(not ina3221.id_matches(0x0000, 0x0000))
+    let c = chip()
+    let d = dut(c)
+    c.regs.insert(0xFF, 0x2260)
+    test.assert(ina3221.id_read(d) == None)
+    c.regs.insert(0xFF, 0x3220)
+    c.regs.insert(0xFE, 0x0000)
+    test.assert(ina3221.id_read(d) == None)
+
+@test
+fn test_a_part_that_leaves_between_the_two_id_reads_has_no_identity() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    c.st.insert(41, 1)
+    test.assert(ina3221.id_read(d) == None)
+
+@test
+fn test_the_bring_up_checks_the_identity_resets_and_checks_config() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    // A part someone configured: the reset brings it back.
+    c.regs.insert(0x00, 0x1A55)
+    c.regs.insert(0x07, 0x3E80)
+    test.assert(ina3221.start(d))
+    test.assert_eq(at(c.st, 60), 1)
+    test.assert_eq(at(c.regs, 0x00), 0x7127)
+    test.assert_eq(at(c.regs, 0x07), 0x7FF8)
+    test.assert_eq(at(c.st, 22), 400000)
+    // The reset writes 0x8000 with the power-on value in the rest.
+    log_is(c, [2, 0x40, 0xFE, 2, -1,
+        2, 0x40, 0xFF, 2, -1,
+        1, 0x40, 0x00, 0xF1, 0x27, -1,
+        2, 0x40, 0x00, 2, -1])
+
+@test
+fn test_the_bring_up_stops_at_each_refusal() [io, hw]
+    // Not an INA3221.
+    let c = chip()
+    c.regs.insert(0xFE, 0x1234)
+    let d = dut(c)
+    test.assert(not ina3221.start(d))
+    test.assert_eq(at(c.st, 60), 0)
+    // A part that does not acknowledge the reset.
+    let e = chip()
+    let f = dut(e)
+    e.st.insert(42, 0)
+    test.assert(not ina3221.start(f))
+    // A part whose CONFIG does not read back its power-on value after the
+    // reset.
+    let g = chip()
+    let h = dut(g)
+    g.st.insert(43, 1)
+    g.regs.insert(0x00, 0x1234)
+    test.assert(not ina3221.start(h))
+    test.assert_eq(at(g.st, 60), 1)
+
+// ── The configuration ────────────────────────────────────────────────
+
+@test
+fn test_config_is_read_and_written_as_fields() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    let r = config_or(ina3221.config_read(d))
+    test.assert_eq(r.channels, 7)
+    test.assert_eq(r.mode, 7)
+    log_is(c, [2, 0x40, 0x00, 2, -1])
+    let w = Ina3221Config { channels: 5, avg: 2, vbus_ct: 3, vshunt_ct: 2, mode: 3 }
+    test.assert(ina3221.config_write(d, w))
+    // 0x4000 | 0x1000 | 2 << 9 | 3 << 6 | 2 << 3 | 3 = 0x5000 | 0x400 | 0xC0 | 0x10 | 3.
+    test.assert_eq(at(c.regs, 0x00), 0x54D3)
+    log_is(c, [1, 0x40, 0x00, 0x54, 0xD3, -1, 2, 0x40, 0x00, 2, -1])
+
+@test
+fn test_config_refuses_a_field_outside_its_range_without_a_transaction() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(not ina3221.config_write(d, Ina3221Config { channels: 8, avg: 0, vbus_ct: 0, vshunt_ct: 0, mode: 0 }))
+    test.assert(not ina3221.config_write(d, Ina3221Config { channels: -1, avg: 0, vbus_ct: 0, vshunt_ct: 0, mode: 0 }))
+    test.assert(not ina3221.config_write(d, Ina3221Config { channels: 7, avg: 8, vbus_ct: 0, vshunt_ct: 0, mode: 0 }))
+    test.assert(not ina3221.config_write(d, Ina3221Config { channels: 7, avg: -1, vbus_ct: 0, vshunt_ct: 0, mode: 0 }))
+    test.assert(not ina3221.config_write(d, Ina3221Config { channels: 7, avg: 0, vbus_ct: 8, vshunt_ct: 0, mode: 0 }))
+    test.assert(not ina3221.config_write(d, Ina3221Config { channels: 7, avg: 0, vbus_ct: -1, vshunt_ct: 0, mode: 0 }))
+    test.assert(not ina3221.config_write(d, Ina3221Config { channels: 7, avg: 0, vbus_ct: 0, vshunt_ct: 8, mode: 0 }))
+    test.assert(not ina3221.config_write(d, Ina3221Config { channels: 7, avg: 0, vbus_ct: 0, vshunt_ct: -1, mode: 0 }))
+    test.assert(not ina3221.config_write(d, Ina3221Config { channels: 7, avg: 0, vbus_ct: 0, vshunt_ct: 0, mode: 8 }))
+    test.assert(not ina3221.config_write(d, Ina3221Config { channels: 7, avg: 0, vbus_ct: 0, vshunt_ct: 0, mode: -1 }))
+    test.assert_eq(at(c.st, 99), 0)
+
+@test
+fn test_one_field_is_changed_and_the_others_are_kept() [io, hw]
+    // The crate's set_channels_enabled masked the register with 0xFFF8 and
+    // so cleared the mode; here the averaging, the times and the mode stay.
+    let c = chip()
+    let d = dut(c)
+    c.regs.insert(0x00, 0x7527)
+    test.assert(ina3221.channels_write(d, 3))
+    test.assert_eq(at(c.regs, 0x00), 0x6527)
+    log_is(c, [2, 0x40, 0x00, 2, -1, 1, 0x40, 0x00, 0x65, 0x27, -1, 2, 0x40, 0x00, 2, -1])
+    test.assert(ina3221.averaging_write(d, 5))
+    test.assert_eq(at(c.regs, 0x00), 0x6B27)
+    test.assert(ina3221.conversion_times_write(d, 1, 6))
+    test.assert_eq(at(c.regs, 0x00), 0x6A77)
+    test.assert(ina3221.mode_write(d, 3))
+    test.assert_eq(at(c.regs, 0x00), 0x6A73)
+    // A field outside its range is refused after the read.
+    test.assert(not ina3221.averaging_write(d, 8))
+    test.assert(not ina3221.conversion_times_write(d, 8, 0))
+    test.assert(not ina3221.mode_write(d, 8))
+    test.assert_eq(at(c.regs, 0x00), 0x6A73)
+
+@test
+fn test_one_channel_is_enabled_or_disabled() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(ina3221.channel_enable(d, 1, false))
+    test.assert_eq(at(c.regs, 0x00), 0x5127)
+    test.assert(ina3221.channel_enable(d, 0, false))
+    test.assert_eq(at(c.regs, 0x00), 0x1127)
+    test.assert(ina3221.channel_enable(d, 2, false))
+    test.assert_eq(at(c.regs, 0x00), 0x0127)
+    test.assert(ina3221.channel_enable(d, 1, true))
+    test.assert_eq(at(c.regs, 0x00), 0x2127)
+    // Enabling one that is enabled changes nothing.
+    test.assert(ina3221.channel_enable(d, 1, true))
+    test.assert_eq(at(c.regs, 0x00), 0x2127)
+    // A channel the part does not have costs no transaction.
+    log_clear(c)
+    test.assert(not ina3221.channel_enable(d, 3, true))
+    test.assert(not ina3221.channel_enable(d, -1, true))
+    test.assert_eq(at(c.st, 99), 0)
+
+@test
+fn test_the_reset_writes_the_reset_bit_with_the_power_on_value() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    c.regs.insert(0x00, 0x1234)
+    test.assert(ina3221.reset(d))
+    test.assert_eq(at(c.regs, 0x00), 0x7127)
+    log_is(c, [1, 0x40, 0x00, 0xF1, 0x27, -1])
+    c.st.insert(42, 0)
+    test.assert(not ina3221.reset(d))
+
+// ── Readings ─────────────────────────────────────────────────────────
+
+@test
+fn test_a_reading_is_the_config_the_shunt_and_the_bus() [io, hw]
+    let c = chip()
+    rail(c)
+    let d = dut(c)
+    let r = reading_or(ina3221.reading_of(d, 0, 100000))
+    test.assert_eq(r.bus.mv, 5000)
+    test.assert_eq(r.shunt.uv, 5000)
+    test.assert_eq(r.current.ua, 50000)
+    test.assert_eq(r.power.uw, 250000)
+    test.assert(not r.overflow)
+    // One transaction each, never a read that runs on.
+    log_is(c, [2, 0x40, 0x00, 2, -1, 2, 0x40, 0x01, 2, -1, 2, 0x40, 0x02, 2, -1])
+
+@test
+fn test_each_channel_reads_its_own_registers() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    c.regs.insert(0x03, 0xC180)
+    c.regs.insert(0x04, 0x2EE0)
+    c.regs.insert(0x05, 0x0008)
+    c.regs.insert(0x06, 0x0008)
+    // A charging battery on channel 1: -80 mV across 0.5 ohm is -160 mA at
+    // 12 V, which flows the other way: a power of -1.92 W.
+    let r = reading_or(ina3221.reading_of(d, 1, 500000))
+    test.assert_eq(r.shunt.uv, -80000)
+    test.assert_eq(r.bus.mv, 12000)
+    test.assert_eq(r.current.ua, -160000)
+    test.assert_eq(r.power.uw, -1920000)
+    log_is(c, [2, 0x40, 0x00, 2, -1, 2, 0x40, 0x03, 2, -1, 2, 0x40, 0x04, 2, -1])
+    let s = reading_or(ina3221.reading_of(d, 2, 1000000))
+    test.assert_eq(s.shunt.uv, 40)
+    test.assert_eq(s.bus.mv, 8)
+    test.assert_eq(s.current.ua, 40)
+    log_is(c, [2, 0x40, 0x00, 2, -1, 2, 0x40, 0x05, 2, -1, 2, 0x40, 0x06, 2, -1])
+
+@test
+fn test_a_disabled_channel_has_no_reading() [io, hw]
+    let c = chip()
+    rail(c)
+    let d = dut(c)
+    c.regs.insert(0x00, 0x3127)
+    test.assert(ina3221.reading_of(d, 0, 100000) == None)
+    log_is(c, [2, 0x40, 0x00, 2, -1])
+    // Its registers still hold the last conversion, and the bus voltage is
+    // read without the channel check.
+    test.assert_eq(mv_or(ina3221.bus_read(d, 0)), 5000)
+
+@test
+fn test_a_reading_is_refused_for_a_channel_or_a_resistance_that_is_not_there() [io, hw]
+    let c = chip()
+    rail(c)
+    let d = dut(c)
+    test.assert(ina3221.reading_of(d, 3, 100000) == None)
+    test.assert(ina3221.reading_of(d, -1, 100000) == None)
+    test.assert(ina3221.reading_of(d, 0, 0) == None)
+    test.assert(ina3221.reading_of(d, 0, -5) == None)
+    test.assert_eq(at(c.st, 99), 0)
+
+@test
+fn test_a_reading_stops_at_the_first_register_that_does_not_answer() [io, hw]
+    let c = chip()
+    rail(c)
+    let d = dut(c)
+    c.st.insert(41, 0)
+    test.assert(ina3221.reading_of(d, 0, 100000) == None)
+    // CONFIG answers, the shunt does not.
+    c.st.insert(41, 1)
+    test.assert(ina3221.reading_of(d, 0, 100000) == None)
+    // The bus does not.
+    c.st.insert(41, 2)
+    test.assert(ina3221.reading_of(d, 0, 100000) == None)
+
+@test
+fn test_a_saturated_shunt_register_sets_overflow_and_no_current() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    c.regs.insert(0x01, 0x7FF8)
+    c.regs.insert(0x02, 0x1388)
+    let r = reading_or(ina3221.reading_of(d, 0, 100000))
+    test.assert(r.overflow)
+    test.assert_eq(r.shunt.uv, 163800)
+    test.assert_eq(r.bus.mv, 5000)
+    test.assert_eq(r.current.ua, 0)
+    test.assert_eq(r.power.uw, 0)
+    c.regs.insert(0x01, 0x8000)
+    let n = reading_or(ina3221.reading_of(d, 0, 100000))
+    test.assert(n.overflow)
+    test.assert_eq(n.shunt.uv, -163840)
+    test.assert_eq(n.current.ua, 0)
+
+@test
+fn test_the_bus_and_shunt_voltages_of_a_channel_are_one_transaction_each() [io, hw]
+    let c = chip()
+    rail(c)
+    let d = dut(c)
+    test.assert_eq(mv_or(ina3221.bus_read(d, 0)), 5000)
+    log_is(c, [2, 0x40, 0x02, 2, -1])
+    test.assert_eq(uv_or(ina3221.shunt_read(d, 0)), 5000)
+    log_is(c, [2, 0x40, 0x01, 2, -1])
+    test.assert_eq(mv_or(ina3221.bus_read(d, 2)), 0)
+    log_is(c, [2, 0x40, 0x06, 2, -1])
+    test.assert(ina3221.bus_read(d, 3) == None)
+    test.assert(ina3221.bus_read(d, -1) == None)
+    test.assert(ina3221.shunt_read(d, 3) == None)
+    test.assert(ina3221.shunt_read(d, -1) == None)
+    test.assert_eq(at(c.st, 99), 0)
+
+// ── Conversions ──────────────────────────────────────────────────────
+
+@test
+fn test_a_continuous_part_is_not_started_and_waits_nothing() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert_eq(ina3221.convert_start(d), 0)
+    log_is(c, [2, 0x40, 0x00, 2, -1])
+
+@test
+fn test_a_triggered_conversion_writes_config_and_answers_its_time() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    // Three channels, 16 averages, 588 us and 332 us, power-down mode.
+    c.regs.insert(0x00, 0x74D0)
+    test.assert_eq(ina3221.convert_start(d), 44160)
+    // Mode 3 written, everything else kept: 0x74D0 | 3.
+    test.assert_eq(at(c.regs, 0x00), 0x74D3)
+    log_is(c, [2, 0x40, 0x00, 2, -1, 1, 0x40, 0x00, 0x74, 0xD3, -1, 2, 0x40, 0x00, 2, -1])
+    // The conversion is ready, once.
+    test.assert(ina3221.conversion_ready(d))
+    test.assert(not ina3221.conversion_ready(d))
+
+@test
+fn test_a_triggered_conversion_times_only_the_enabled_channels() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    c.regs.insert(0x00, 0x2120)
+    // One channel, one average, 1.1 ms each signal: 2200 us.
+    test.assert_eq(ina3221.convert_start(d), 2200)
+
+@test
+fn test_with_no_channel_enabled_there_is_nothing_to_convert() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    c.regs.insert(0x00, 0x0120)
+    test.assert_eq(ina3221.convert_start(d), -1)
+    log_is(c, [2, 0x40, 0x00, 2, -1])
+
+@test
+fn test_a_triggered_conversion_the_part_does_not_take_answers_minus_one() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    c.regs.insert(0x00, 0x7120)
+    c.st.insert(42, 0)
+    test.assert_eq(ina3221.convert_start(d), -1)
+
+@test
+fn test_conversion_ready_is_bit_0_and_reading_clears_it() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    c.st.insert(50, 0x0001)
+    test.assert(ina3221.conversion_ready(d))
+    log_is(c, [2, 0x40, 0x0F, 2, -1])
+    test.assert(not ina3221.conversion_ready(d))
+    // A flag that is not Conversion Ready does not count.
+    c.st.insert(50, 0x0040)
+    test.assert(not ina3221.conversion_ready(d))
+
+// ── The alerts ───────────────────────────────────────────────────────
+
+@test
+fn test_the_critical_and_warning_limits_of_each_channel() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(ina3221.critical_write(d, 0, 80000))
+    test.assert_eq(at(c.regs, 0x07), 0x3E80)
+    log_is(c, [1, 0x40, 0x07, 0x3E, 0x80, -1, 2, 0x40, 0x07, 2, -1])
+    test.assert(ina3221.critical_write(d, 1, -80000))
+    test.assert_eq(at(c.regs, 0x09), 0xC180)
+    test.assert(ina3221.critical_write(d, 2, 163800))
+    test.assert_eq(at(c.regs, 0x0B), 0x7FF8)
+    log_clear(c)
+    test.assert(ina3221.warning_write(d, 0, 40))
+    test.assert_eq(at(c.regs, 0x08), 0x0008)
+    test.assert(ina3221.warning_write(d, 1, 0))
+    test.assert_eq(at(c.regs, 0x0A), 0x0000)
+    test.assert(ina3221.warning_write(d, 2, -163840))
+    test.assert_eq(at(c.regs, 0x0C), 0x8000)
+    log_clear(c)
+    test.assert_eq(uv_or(ina3221.critical_read(d, 0)), 80000)
+    log_is(c, [2, 0x40, 0x07, 2, -1])
+    test.assert_eq(uv_or(ina3221.critical_read(d, 1)), -80000)
+    test.assert_eq(uv_or(ina3221.critical_read(d, 2)), 163800)
+    test.assert_eq(uv_or(ina3221.warning_read(d, 0)), 40)
+    log_is(c, [2, 0x40, 0x09, 2, -1, 2, 0x40, 0x0B, 2, -1, 2, 0x40, 0x08, 2, -1])
+    test.assert_eq(uv_or(ina3221.warning_read(d, 2)), -163840)
+
+@test
+fn test_the_power_on_limit_is_full_scale_and_so_off() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert_eq(uv_or(ina3221.critical_read(d, 0)), 163800)
+    test.assert_eq(uv_or(ina3221.warning_read(d, 1)), 163800)
+
+@test
+fn test_a_limit_outside_the_register_or_a_channel_outside_the_part_is_refused() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(not ina3221.critical_write(d, 0, 163801))
+    test.assert(not ina3221.critical_write(d, 0, -163841))
+    test.assert(not ina3221.critical_write(d, 3, 0))
+    test.assert(not ina3221.critical_write(d, -1, 0))
+    test.assert(not ina3221.warning_write(d, 0, 163801))
+    test.assert(not ina3221.warning_write(d, 3, 0))
+    test.assert(not ina3221.warning_write(d, -1, 0))
+    test.assert(ina3221.critical_read(d, 3) == None)
+    test.assert(ina3221.critical_read(d, -1) == None)
+    test.assert(ina3221.warning_read(d, 3) == None)
+    test.assert(ina3221.warning_read(d, -1) == None)
+    test.assert_eq(at(c.st, 99), 0)
+
+@test
+fn test_the_three_reserved_bits_of_a_limit_are_not_compared() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    c.ro.insert(0x07, 1)
+    c.regs.insert(0x07, 0x3E87)
+    // The part would hold reserved bits; the compare is under 0xFFF8.
+    test.assert(ina3221.critical_write(d, 0, 80000))
+    c.regs.insert(0x07, 0x3E88)
+    test.assert(not ina3221.critical_write(d, 0, 80000))
+
+@test
+fn test_the_sum_of_the_shunt_voltages_and_its_limit() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    c.regs.insert(0x0D, 0x07D0)
+    test.assert_eq(uv_or(ina3221.sum_read(d)), 40000)
+    log_is(c, [2, 0x40, 0x0D, 2, -1])
+    test.assert(ina3221.sum_limit_write(d, 40000))
+    test.assert_eq(at(c.regs, 0x0E), 0x07D0)
+    log_is(c, [1, 0x40, 0x0E, 0x07, 0xD0, -1, 2, 0x40, 0x0E, 2, -1])
+    test.assert(ina3221.sum_limit_write(d, -655360))
+    test.assert_eq(at(c.regs, 0x0E), 0x8000)
+    test.assert(not ina3221.sum_limit_write(d, 655321))
+    test.assert(not ina3221.sum_limit_write(d, -655361))
+    test.assert_eq(at(c.st, 99), 11)
+
+@test
+fn test_the_power_valid_limits_are_written_upper_first() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert_eq(mv_or(ina3221.pv_upper_read(d)), 10000)
+    test.assert_eq(mv_or(ina3221.pv_lower_read(d)), 9000)
+    log_is(c, [2, 0x40, 0x10, 2, -1, 2, 0x40, 0x11, 2, -1])
+    // 4.5 V and 4.0 V: 562 and 500 steps of 8 mV; 4496 and 4000 are the
+    // limits the part can hold, 0x08C0 << ... = 562 << 3 = 4496 = 0x1190.
+    test.assert(ina3221.pv_write(d, 4500, 4000))
+    test.assert_eq(at(c.regs, 0x10), 0x1190)
+    test.assert_eq(at(c.regs, 0x11), 0x0FA0)
+    log_is(c, [1, 0x40, 0x10, 0x11, 0x90, -1, 2, 0x40, 0x10, 2, -1,
+        1, 0x40, 0x11, 0x0F, 0xA0, -1, 2, 0x40, 0x11, 2, -1])
+    test.assert_eq(mv_or(ina3221.pv_upper_read(d)), 4496)
+    test.assert_eq(mv_or(ina3221.pv_lower_read(d)), 4000)
+
+@test
+fn test_a_power_valid_limit_outside_the_register_or_inverted_is_refused() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(not ina3221.pv_write(d, 32761, 100))
+    test.assert(not ina3221.pv_write(d, -1, -2))
+    test.assert(not ina3221.pv_write(d, 5000, 32761))
+    test.assert(not ina3221.pv_write(d, 5000, -1))
+    test.assert(not ina3221.pv_write(d, 4000, 5000))
+    test.assert_eq(at(c.st, 99), 0)
+    // The upper limit written and the lower refused by the part.
+    c.ro.insert(0x11, 1)
+    test.assert(not ina3221.pv_write(d, 5000, 4000))
+    c.ro.insert(0x11, 0)
+    c.regs.insert(0x10, 0x2710)
+    c.ro.insert(0x10, 1)
+    test.assert(not ina3221.pv_write(d, 5000, 4000))
+
+@test
+fn test_the_alert_configuration_is_written_and_read_back_under_its_mask() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    let a = Ina3221Alert { sum_channels: 5, warning_latch: true, critical_latch: false }
+    test.assert(ina3221.alert_write(d, a))
+    // SCC1 (bit 14) and SCC3 (bit 12), WEN (bit 11): 0x5800; the timing
+    // flag that reads 1 is kept.
+    test.assert_eq(at(c.regs, 0x0F), 0x5802)
+    log_is(c, [1, 0x40, 0x0F, 0x58, 0x00, -1, 2, 0x40, 0x0F, 2, -1])
+    test.assert(not ina3221.alert_write(d, Ina3221Alert { sum_channels: 8, warning_latch: false, critical_latch: false }))
+    test.assert(not ina3221.alert_write(d, Ina3221Alert { sum_channels: -1, warning_latch: false, critical_latch: false }))
+    test.assert_eq(at(c.st, 99), 0)
+    // Flags that came up are not a part of what is compared.
+    c.st.insert(50, 0x03F9)
+    test.assert(ina3221.alert_write(d, Ina3221Alert { sum_channels: 0, warning_latch: false, critical_latch: true }))
+    test.assert_eq(at(c.regs, 0x0F), 0x0402)
+
+@test
+fn test_writing_mask_enable_does_not_clear_the_flags_and_reading_does() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    c.st.insert(50, 0x0201)
+    test.assert(ina3221.alert_write(d, Ina3221Alert { sum_channels: 1, warning_latch: false, critical_latch: false }))
+    // The write was followed by a read-back, which showed the flags once
+    // and cleared them.
+    let f = flags_or(ina3221.flags_read(d))
+    test.assert_eq(f.critical, 0)
+    test.assert(not f.ready)
+    c.st.insert(50, 0x0201)
+    let g = flags_or(ina3221.flags_read(d))
+    test.assert_eq(g.critical, 1)
+    test.assert_eq(g.warning, 0)
+    test.assert(g.ready)
+    // The timing-control flag stays, as the sheet says (Table 8-34).
+    test.assert(g.timing)
+    test.assert(flags_or(ina3221.flags_read(d)).timing)
+    test.assert(not flags_or(ina3221.flags_read(d)).ready)
+
+// ── The device type over absent hardware ─────────────────────────────
+//
+// The host's handles are absent hardware: every transfer is refused, so
+// each method answers its "no part" value.  This runs the lines of the type
+// that forward to the functions above, and the guards of the trait methods.
+
+fn board() -> Ina3221
+    let w = dev_bus.wiring_i2c(0, 0x40)
+    Ina3221.attach(BoardI2c { id: 0 }, BoardGpio { id: 0 }, w, 100000, 0, 500000)
+
+@test
+fn test_the_type_over_absent_hardware() [io, hw]
+    let p = board()
+    test.assert_eq(p.shunt(0), 100000)
+    test.assert_eq(p.shunt(1), 0)
+    test.assert_eq(p.shunt(2), 500000)
+    test.assert_eq(p.shunt(3), 0)
+    test.assert(not p.begin())
+    test.assert(p.reg(0x00) == None)
+    test.assert(p.shunt_voltage(0) == None)
+    test.assert(p.flags() == None)
+    test.assert(not p.ready())
+    test.assert(p.config() == None)
+    test.assert(not p.set_config(Ina3221Config { channels: 7, avg: 0, vbus_ct: 4, vshunt_ct: 4, mode: 7 }))
+    test.assert(not p.set_channel(0, false))
+    test.assert(not p.set_averaging(1))
+    test.assert(not p.set_conversion_times(1, 1))
+    test.assert(not p.set_mode(3))
+    test.assert(not p.set_critical(0, 1000))
+    test.assert(not p.set_warning(0, 1000))
+    test.assert(p.critical(0) == None)
+    test.assert(p.warning(0) == None)
+    test.assert(p.sum() == None)
+    test.assert(not p.set_sum_limit(1000))
+    test.assert(not p.set_alert(Ina3221Alert { sum_channels: 1, warning_latch: false, critical_latch: false }))
+    test.assert(not p.set_power_valid(5000, 4000))
+    test.assert(p.power_valid_upper() == None)
+    test.assert(p.power_valid_lower() == None)
+    test.assert_eq(p.alert_pin(), -1)
+    test.assert(p.device_id() == None)
+
+@test
+fn test_the_current_monitor_over_absent_hardware() [io, hw]
+    let p = board()
+    test.assert_eq(p.mon_channels(), 3)
+    // A channel the part does not have, a shunt other than the board's, a
+    // channel the board does not use, and a shunt that saturates.
+    test.assert(not p.mon_set_shunt(3, 100000, 800000))
+    test.assert(not p.mon_set_shunt(-1, 100000, 800000))
+    test.assert(not p.mon_set_shunt(0, 50000, 800000))
+    test.assert(not p.mon_set_shunt(1, 0, 800000))
+    test.assert(not p.mon_set_shunt(0, 100000, 2000000))
+    // The board's shunt reaches the bus, which is absent.
+    test.assert(not p.mon_set_shunt(0, 100000, 800000))
+    test.assert(p.mon_read(3) == None)
+    test.assert(p.mon_read(1) == None)
+    test.assert(p.mon_read(0) == None)
+    test.assert(p.mon_bus_voltage(3) == None)
+    test.assert(p.mon_bus_voltage(0) == None)
+    test.assert_eq(p.mon_start(), -1)
+    // A read after the wait gives the same answer as a read.
+    test.assert(p.mon_read_after(0, 10, 100) == None)
+    test.assert(p.mon_read_after(0, 100, 100) == None)
+
+// ── The CurrentMonitor logic over the double ─────────────────────────
+
+@test
+fn test_a_shunt_is_taken_into_use_by_enabling_its_channel() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    c.regs.insert(0x00, 0x0127)
+    // The board's shunts are 0.1 ohm, none, 0.5 ohm.
+    test.assert(ina3221.shunt_set(d, 100000, 0, 500000, 0, 100000, 800000))
+    test.assert_eq(at(c.regs, 0x00), 0x4127)
+    test.assert(ina3221.shunt_set(d, 100000, 0, 500000, 2, 500000, 300000))
+    test.assert_eq(at(c.regs, 0x00), 0x5127)
+    // 163.8 mV across 0.1 ohm is 1.638 A.
+    test.assert(ina3221.shunt_set(d, 100000, 0, 500000, 0, 100000, 1638000))
+    log_clear(c)
+    test.assert(not ina3221.shunt_set(d, 100000, 0, 500000, 0, 100000, 1639000))
+    // A different resistance, a channel without one, a channel that is not
+    // there and a largest current of 0 cost no transaction.
+    test.assert(not ina3221.shunt_set(d, 100000, 0, 500000, 0, 99999, 800000))
+    test.assert(not ina3221.shunt_set(d, 100000, 0, 500000, 1, 0, 800000))
+    test.assert(not ina3221.shunt_set(d, 100000, 0, 500000, 1, 100000, 800000))
+    test.assert(not ina3221.shunt_set(d, 100000, 0, 500000, 3, 100000, 800000))
+    test.assert(not ina3221.shunt_set(d, 100000, 0, 500000, -1, 100000, 800000))
+    test.assert(not ina3221.shunt_set(d, 100000, 0, 500000, 0, 100000, 0))
+    test.assert_eq(at(c.st, 99), 0)
+
+@test
+fn test_the_shunt_of_a_channel_is_the_one_attached() [io, hw]
+    test.assert_eq(ina3221.shunt_of(1, 2, 3, 0), 1)
+    test.assert_eq(ina3221.shunt_of(1, 2, 3, 1), 2)
+    test.assert_eq(ina3221.shunt_of(1, 2, 3, 2), 3)
+    test.assert_eq(ina3221.shunt_of(1, 2, 3, 3), 0)
+    test.assert_eq(ina3221.shunt_of(1, 2, 3, -1), 0)
+
+// ── The awaitable form ───────────────────────────────────────────────
+
+fn timed(c: Chip) -> Ina3221Timed<Dut>
+    system
+        return Ina3221Timed { port: dut(c), shunt0: 100000, shunt1: 0, shunt2: 500000 }
+
+@test
+fn test_an_awaited_measurement_starts_waits_and_reads() [io, hw, async, time]
+    let c = chip()
+    rail(c)
+    // One channel, 1 average, 140 us each signal, power-down: the pass takes
+    // 280 us, which the wait rounds up to 1 ms.
+    c.regs.insert(0x00, 0x4000)
+    let t = timed(c)
+    let r = reading_or(await t.mon_measure(0))
+    test.assert_eq(r.current.ua, 50000)
+    test.assert_eq(r.power.uw, 250000)
+    test.assert_eq(at(c.regs, 0x00), 0x4003)
+
+@test
+fn test_an_awaited_measurement_of_nothing_answers_none() [io, hw, async, time]
+    let c = chip()
+    c.regs.insert(0x00, 0x0120)
+    let t = timed(c)
+    test.assert(await t.mon_measure(0) == None)
+    // The part is not there.
+    let e = chip()
+    e.st.insert(4, 0)
+    let u = timed(e)
+    test.assert(await u.mon_measure(0) == None)
