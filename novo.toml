@@ -1,6 +1,6 @@
 [package]
 name        = "ina3221-nv"
-version     = "0.1.0"
+version     = "0.2.0"
 description = "A driver for Texas Instruments' INA3221 three-channel current and voltage monitor on an I2C bus: the configuration (channel enables, averaging, bus and shunt conversion times, mode), the shunt and bus voltage of each channel and the current from the shunt resistance given at attach, the critical and warning alert limits of each channel, the shunt-voltage sum and its limit, the alert flags, the power-valid limits, and the manufacturer and die ID check, as devices-nv's CurrentMonitor for three channels and Identifiable."
 license     = "Apache-2.0"
 stability   = "experimental"
