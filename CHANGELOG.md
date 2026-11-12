@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+Moves off its stand-ins onto devices-nv 0.4.0 and embedded-hal-nv 0.4.0, which
+are path dependencies until they are published.
+
+- `set_channel` on `Ina3221` is gone; `CurrentMonitor.mon_set_enabled`
+  replaces it.
+- `CurrentMonitor.mon_set_alert` sets the critical limit for
+  `AlertCurrentOver`, taking microamps and converting them with the
+  channel's shunt, and the power-valid upper limit for `AlertBusOver`,
+  taking millivolts and refusing one below the lower limit.  Every other
+  `MonAlert` value is refused.  The warning limit stays `set_warning`.
+- `CurrentMonitor.mon_flags` answers `MON_FLAG_ALERT` for a critical, warning
+  or sum flag, `MON_FLAG_READY` for Conversion Ready, and `MON_FLAG_OVERFLOW`
+  when the shunt register of an enabled channel is at either end of its range.
+  The read clears the flags in MASK/ENABLE, as `flags()` does.
+- The three shunt resistances stay arguments of `attach`.
+
 ## 0.1.0
 
 The first release: a driver for Texas Instruments' INA3221 three-channel

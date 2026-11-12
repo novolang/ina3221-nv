@@ -24,7 +24,7 @@ use std.test
 use embedded_hal.{ BoardI2c, BoardGpio, I2cBus, GpioOut }
 use dev_bus.{ DeviceWiring, DevBytes }
 use dev_power.{ MilliVolts }
-use dev_current.{ MicroVolts, MicroAmps, MicroWatts, MonReading, CurrentMonitor, CurrentMonitorAsync }
+use dev_current.{ MicroVolts, MicroAmps, MicroWatts, MonReading, MonAlert, CurrentMonitor, CurrentMonitorAsync, MON_FLAG_ALERT, MON_FLAG_READY, MON_FLAG_OVERFLOW }
 use dev_id.{ DeviceId, Identifiable }
 use ina3221
 use ina3221.{ Ina3221, Ina3221Config, Ina3221Flags, Ina3221Alert, Ina3221Port }
@@ -1115,6 +1115,108 @@ fn test_writing_mask_enable_does_not_clear_the_flags_and_reading_does() [io, hw]
     test.assert(flags_or(ina3221.flags_read(d)).timing)
     test.assert(not flags_or(ina3221.flags_read(d)).ready)
 
+@test
+fn test_the_upper_power_valid_limit_is_written_alone_and_not_below_the_lower() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    // The lower limit stays at 9000 mV.
+    test.assert(ina3221.pv_upper_write(d, 12000))
+    test.assert_eq(mv_or(ina3221.pv_upper_read(d)), 12000)
+    test.assert_eq(mv_or(ina3221.pv_lower_read(d)), 9000)
+    log_clear(c)
+    test.assert(ina3221.pv_upper_write(d, 9000))
+    test.assert(not ina3221.pv_upper_write(d, 8999))
+    test.assert(not ina3221.pv_upper_write(d, 32761))
+    test.assert(not ina3221.pv_upper_write(d, -1))
+    // The lower limit cannot be read, and the register is frozen.
+    let e = chip()
+    e.st.insert(41, 0)
+    test.assert(not ina3221.pv_upper_write(dut(e), 12000))
+    let f = chip()
+    f.ro.insert(0x10, 1)
+    test.assert(not ina3221.pv_upper_write(dut(f), 12000))
+
+@test
+fn test_a_current_alert_is_the_critical_limit_in_the_shunt_voltage_of_that_current() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    // 800 mA through 0.1 ohm drops 80 mV: the critical limit of the
+    // sheet's example, 0x3E80.
+    test.assert(ina3221.alert_limit_set(d, 100000, 0, MonAlert.AlertCurrentOver, 800000))
+    test.assert_eq(at(c.regs, 0x07), 0x3E80)
+    // 100 mA through 0.5 ohm drops 50 mV, 1250 steps.
+    test.assert(ina3221.alert_limit_set(d, 500000, 2, MonAlert.AlertCurrentOver, 100000))
+    test.assert_eq(at(c.regs, 0x0B), 1250 << 3)
+    // A current below the shunt's reach rounds toward zero, and a negative
+    // one is a negative shunt voltage.
+    test.assert(ina3221.alert_limit_set(d, 100000, 1, MonAlert.AlertCurrentOver, -800000))
+    test.assert_eq(at(c.regs, 0x09), 0xC180)
+    // A channel without a shunt, a channel the part lacks, a limit past the
+    // register (1.7 A through 0.1 ohm is 170 mV) and the values the part has
+    // no register for are refused without a transaction.
+    log_clear(c)
+    test.assert(not ina3221.alert_limit_set(d, 0, 1, MonAlert.AlertCurrentOver, 1000))
+    test.assert(not ina3221.alert_limit_set(d, 100000, 3, MonAlert.AlertCurrentOver, 1000))
+    test.assert(not ina3221.alert_limit_set(d, 100000, -1, MonAlert.AlertBusOver, 1000))
+    test.assert(not ina3221.alert_limit_set(d, 100000, 0, MonAlert.AlertCurrentOver, 1700000))
+    test.assert(not ina3221.alert_limit_set(d, 100000, 0, MonAlert.AlertCurrentUnder, 1000))
+    test.assert(not ina3221.alert_limit_set(d, 100000, 0, MonAlert.AlertBusUnder, 1000))
+    test.assert(not ina3221.alert_limit_set(d, 100000, 0, MonAlert.AlertPowerOver, 1000))
+    test.assert_eq(at(c.st, 99), 0)
+
+@test
+fn test_a_bus_alert_is_the_power_valid_upper_limit_for_every_channel() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    // 4.5 V is 562 steps of 8 mV, 4496 mV, and is below the lower limit of
+    // 9 V, so it is refused; 12 V is held.
+    test.assert(not ina3221.alert_limit_set(d, 100000, 0, MonAlert.AlertBusOver, 4500))
+    test.assert(ina3221.alert_limit_set(d, 100000, 0, MonAlert.AlertBusOver, 12000))
+    test.assert_eq(mv_or(ina3221.pv_upper_read(d)), 12000)
+    test.assert(ina3221.alert_limit_set(d, 0, 1, MonAlert.AlertBusOver, 13000))
+    test.assert_eq(mv_or(ina3221.pv_upper_read(d)), 13000)
+
+@test
+fn test_the_flags_are_the_alert_ready_and_overflow_bits_of_mask_enable() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert_eq(ina3221.mon_flags_of(d), 0)
+    // CF1 and Conversion Ready.
+    c.st.insert(50, 0x0201)
+    test.assert_eq(ina3221.mon_flags_of(d), MON_FLAG_ALERT + MON_FLAG_READY)
+    // The read cleared them.
+    test.assert_eq(ina3221.mon_flags_of(d), 0)
+    // A warning flag, a sum flag; the power-valid and timing flags are not
+    // alerts.
+    c.st.insert(50, 0x0020)
+    test.assert_eq(ina3221.mon_flags_of(d), MON_FLAG_ALERT)
+    c.st.insert(50, 0x0040)
+    test.assert_eq(ina3221.mon_flags_of(d), MON_FLAG_ALERT)
+    c.st.insert(50, 0x0006)
+    test.assert_eq(ina3221.mon_flags_of(d), 0)
+    // A saturated shunt register of an enabled channel, at either end.
+    c.regs.insert(0x03, 0x7FF8)
+    test.assert_eq(ina3221.mon_flags_of(d), MON_FLAG_OVERFLOW)
+    c.regs.insert(0x03, 0x8000)
+    test.assert_eq(ina3221.mon_flags_of(d), MON_FLAG_OVERFLOW)
+    c.st.insert(50, 0x0201)
+    test.assert_eq(ina3221.mon_flags_of(d), MON_FLAG_ALERT + MON_FLAG_READY + MON_FLAG_OVERFLOW)
+    // The same register on a channel that is switched off does not count
+    // (channel 1 is CONFIG's bit 13).
+    c.regs.insert(0x00, 0x5127)
+    test.assert_eq(ina3221.mon_flags_of(d), 0)
+    // The part stops answering after MASK/ENABLE, or after CONFIG: the
+    // overflow is not known, the flags that were read stay.
+    c.regs.insert(0x00, 0x7127)
+    c.st.insert(50, 0x0201)
+    c.st.insert(41, 1)
+    test.assert_eq(ina3221.mon_flags_of(d), MON_FLAG_ALERT + MON_FLAG_READY)
+    c.st.insert(41, 2)
+    test.assert_eq(ina3221.mon_flags_of(d), 0)
+    // MASK/ENABLE itself does not answer.
+    c.st.insert(41, 0)
+    test.assert_eq(ina3221.mon_flags_of(d), 0)
+
 // ── The device type over absent hardware ─────────────────────────────
 //
 // The host's handles are absent hardware: every transfer is refused, so
@@ -1139,7 +1241,7 @@ fn test_the_type_over_absent_hardware() [io, hw]
     test.assert(not p.ready())
     test.assert(p.config() == None)
     test.assert(not p.set_config(Ina3221Config { channels: 7, avg: 0, vbus_ct: 4, vshunt_ct: 4, mode: 7 }))
-    test.assert(not p.set_channel(0, false))
+    test.assert(not p.mon_set_enabled(0, false))
     test.assert(not p.set_averaging(1))
     test.assert(not p.set_conversion_times(1, 1))
     test.assert(not p.set_mode(3))
@@ -1175,6 +1277,13 @@ fn test_the_current_monitor_over_absent_hardware() [io, hw]
     test.assert(p.mon_bus_voltage(3) == None)
     test.assert(p.mon_bus_voltage(0) == None)
     test.assert_eq(p.mon_start(), -1)
+    // The channel switch, the alert limits and the flags reach the bus,
+    // which is absent; a limit the part has no register for does not.
+    test.assert(not p.mon_set_enabled(2, true))
+    test.assert(not p.mon_set_alert(0, MonAlert.AlertCurrentOver, 500000))
+    test.assert(not p.mon_set_alert(0, MonAlert.AlertBusOver, 6000))
+    test.assert(not p.mon_set_alert(0, MonAlert.AlertPowerOver, 6000))
+    test.assert_eq(p.mon_flags(), 0)
     // A read after the wait gives the same answer as a read.
     test.assert(p.mon_read_after(0, 10, 100) == None)
     test.assert(p.mon_read_after(0, 100, 100) == None)

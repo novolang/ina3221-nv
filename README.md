@@ -193,7 +193,8 @@ after channel 1 does, at power-up.  The pins are open-drain.
 A program on a board uses `Ina3221`, built by `attach` with the board's bus,
 its GPIO, the wiring and the shunt resistance of each channel in
 micro-ohms.  The resistances are facts about the board, as the address is,
-and the driver keeps them.  The wiring's `irq` is the Critical pin.  The
+and the driver keeps them: the trait's methods are called on a plain `self`,
+which holds no state that `mon_set_shunt` could set.  The wiring's `irq` is the Critical pin.  The
 type implements `CurrentMonitor` and `Identifiable`.
 
 | Method | What it does |
@@ -207,8 +208,11 @@ type implements `CurrentMonitor` and `Identifiable`.
 | `device_id()` | `Identifiable`: the die ID, 0x3220, no revision |
 | `shunt_voltage(ch)`, `sum()` | the shunt voltage of a channel; the sum register |
 | `flags()`, `ready()` | the MASK/ENABLE flags; the Conversion Ready flag. Both clear it |
-| `config()`, `set_config(c)`, `set_channel(ch, on)`, `set_averaging(n)`, `set_conversion_times(b, s)`, `set_mode(n)` | the CONFIG fields; each write is read back |
-| `set_critical(ch, uv)`, `set_warning(ch, uv)`, `critical(ch)`, `warning(ch)` | the alert limits in microvolts across the shunt |
+| `mon_set_enabled(ch, on)` | `CurrentMonitor`: switches one channel's conversion on or off, keeping the other CONFIG fields |
+| `mon_set_alert(ch, what, limit)` | `CurrentMonitor`: `AlertCurrentOver` is the critical limit, in microamps through the channel's shunt; `AlertBusOver` is the power-valid upper limit, in millivolts, for all channels; the other values are refused |
+| `mon_flags()` | `CurrentMonitor`: `MON_FLAG_ALERT` for a critical, warning or sum flag, `MON_FLAG_READY` for Conversion Ready, `MON_FLAG_OVERFLOW` for a saturated shunt register of an enabled channel; the read clears the flags |
+| `config()`, `set_config(c)`, `set_averaging(n)`, `set_conversion_times(b, s)`, `set_mode(n)` | the CONFIG fields; each write is read back |
+| `set_critical(ch, uv)`, `set_warning(ch, uv)`, `critical(ch)`, `warning(ch)` | the alert limits in microvolts across the shunt; the warning limit has no `MonAlert` value |
 | `set_sum_limit(uv)`, `set_alert(a)` | the sum limit; the summed channels and the latch bits |
 | `set_power_valid(upper_mv, lower_mv)`, `power_valid_upper()`, `power_valid_lower()` | the power-valid limits in millivolts |
 | `alert_pin()` | the level of the Critical pin, −1 for a wiring with none |
@@ -293,9 +297,12 @@ part has no pin that signals a finished conversion, so there is no
 - The Timing Control and Power Valid pins as awaitable edges.  The wiring
   carries one pin, the Critical pin; a program that uses the others waits for
   them with the board's `GpioInAsync`.  NOT IMPLEMENTED.
-- A current limit in microamps: the limits are in microvolts across the
-  shunt, since the part compares voltages.  A program converts with the
-  resistance.
+- A current limit in microamps for the warning limit, a lower current limit
+  and a power limit: `MonAlert` has one `AlertCurrentOver`, which is the
+  critical limit, and the part compares shunt voltages.  The warning limit
+  is `set_warning`, in microvolts across the shunt.
+- A lower bus limit through the trait: `AlertBusUnder` is refused, and the
+  power-valid lower limit is `set_power_valid`.
 - An averaged wait: a program that wants to wait for a result polls
   `ready()` or waits `mon_start`'s time.
 - The INA219 and the INA226, which are other parts: `i2c-devices-nv` drives

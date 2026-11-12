@@ -29,8 +29,8 @@ main    = "src/main.nv"
 
 [dependencies]
 ina3221-nv     = { path = "$PKG" }
-devices-nv      = "^0.3.3"
-embedded-hal-nv = "^0.3.3"
+devices-nv      = { path = "$PKG/../devices-nv" }
+embedded-hal-nv = { path = "$PKG/../embedded-hal-nv" }
 EOF
 
 fail=0

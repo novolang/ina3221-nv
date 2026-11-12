@@ -8,7 +8,8 @@
 // While the task is parked the scheduler runs the others.
 //
 // An `async fn` cannot take a `@value` struct (E2015), and `Ina3221` is one,
-// so the type here is a plain struct that holds a port and the resistances.
+// so the type here is a plain struct that holds a port and the resistances
+// (this stays: planning page 3.5, the `*Async` row).
 // An `async fn` is refused at the embedded tier, so the method is
 // `@tier(app)`; a device program waits the time `mon_start` answers.
 

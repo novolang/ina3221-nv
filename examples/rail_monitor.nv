@@ -74,7 +74,7 @@ fn main() [hw]
         hal.uart.write("ina3221: shunt refused\n")
         return
     // Channel 3 is not wired; leaving it out of the pass shortens it.
-    if not part.set_channel(2, false)
+    if not part.mon_set_enabled(2, false)
         hal.uart.write("ina3221: channel refused\n")
         return
     loop

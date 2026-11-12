@@ -28,7 +28,9 @@ tier = "embedded"
 [dependencies]
 # The board's I2C bus and GPIO handles, and the I2cBus and GpioOut traits
 # they implement.
-embedded-hal-nv = "^0.3.3"
+# A path dependency until 0.4.0 is published: PATH-DEPENDENCIES.md in the
+# parent directory lists the line that becomes "^0.4.0".
+embedded-hal-nv = { path = "../embedded-hal-nv" }
 # The wiring record a board's device table hands `attach`, the register
 # helpers, and the CurrentMonitor trait.
-devices-nv      = "^0.3.3"
+devices-nv      = { path = "../devices-nv" }

@@ -94,7 +94,7 @@
 use embedded_hal.{ BoardI2c, BoardGpio, I2cBus, GpioOut }
 use dev_bus.{ DeviceWiring, DevBytes }
 use dev_power.{ MilliVolts }
-use dev_current.{ MicroVolts, MicroAmps, MicroWatts, MonReading, CurrentMonitor }
+use dev_current.{ MicroVolts, MicroAmps, MicroWatts, MonReading, MonAlert, CurrentMonitor, MON_FLAG_ALERT, MON_FLAG_READY, MON_FLAG_OVERFLOW }
 use dev_id.{ DeviceId, Identifiable }
 
 // The registers (Table 8-1).  The registers of channel `ch` are 2 * ch past
@@ -687,6 +687,67 @@ pub fn pv_lower_read<P: Ina3221Port>(p: P) -> ?MilliVolts [hw]
     let Some(raw) = reg_read(p, REG_PV_LOWER) else return None
     Some(MilliVolts { mv: bus_mv_of(raw) })
 
+// Writes the power-valid upper limit in millivolts alone and keeps the lower
+// one.  A limit outside 0 to 32760 and one below the lower limit are
+// refused.  Whether the part holds the value.
+pub fn pv_upper_write<P: Ina3221Port>(p: P, mv: Int) -> Bool [hw]
+    if not pv_limit_fits(mv)
+        return false
+    let Some(lower) = pv_lower_read(p) else return false
+    if mv < lower.mv
+        return false
+    reg_set(p, REG_PV_UPPER, pv_limit_raw(mv), 0x7FF8)
+
+// `CurrentMonitor.mon_set_alert` for channel `ch`, whose shunt is
+// `shunt_micro_ohm`.  `AlertCurrentOver` is the critical limit, in
+// microamps: the shunt voltage of that current, rounded toward zero, so the
+// part has no calibration to set and a channel without a shunt is refused.
+// `AlertBusOver` is the power-valid upper limit, in millivolts, which the
+// part holds once for all its channels; `ch` only has to be one of them.
+// The other values of `MonAlert` are refused without a transaction, and so
+// is the warning limit, which `MonAlert` has no value for (`warning_write`
+// sets it).  Whether the part took it.
+pub fn alert_limit_set<P: Ina3221Port>(p: P, shunt_micro_ohm: Int, ch: Int, what: MonAlert,
+                                       limit: Int) -> Bool [hw]
+    if ch < 0 or ch > 2
+        return false
+    match what
+        MonAlert.AlertCurrentOver =>
+            if shunt_micro_ohm <= 0
+                return false
+            critical_write(p, ch, limit * shunt_micro_ohm / 1000000)
+        MonAlert.AlertBusOver     => pv_upper_write(p, limit)
+        _                         => false
+
+// Whether a channel the CONFIG register enables has a shunt register at
+// either end of its range, where the ADC has saturated.
+fn any_saturated<P: Ina3221Port>(p: P) -> Bool [hw]
+    let Some(c) = config_read(p) else return false
+    for ch in 0..3
+        if (c.channels & (1 << ch)) != 0
+            let raw = reg_read(p, REG_SHUNT1 + 2 * ch) ?? 0
+            if shunt_saturated(raw)
+                return true
+    false
+
+// `CurrentMonitor.mon_flags`: the `MON_FLAG_*` bits of MASK/ENABLE, which
+// this read clears.  `MON_FLAG_ALERT` is a critical, warning or sum flag,
+// `MON_FLAG_READY` is Conversion Ready, and `MON_FLAG_OVERFLOW` is a
+// saturated shunt register of an enabled channel, as `reading_of` reports
+// it, since the part has no math overflow flag.  0 when the part did not
+// answer.
+pub fn mon_flags_of<P: Ina3221Port>(p: P) -> Int [hw]
+    let Some(m) = reg_read(p, REG_MASK) else return 0
+    let f = flags_of(m)
+    var bits = 0
+    if f.critical != 0 or f.warning != 0 or f.sum
+        bits = bits | MON_FLAG_ALERT
+    if f.ready
+        bits = bits | MON_FLAG_READY
+    if any_saturated(p)
+        bits = bits | MON_FLAG_OVERFLOW
+    bits
+
 // The MASK/ENABLE value for an alert configuration: SCC1 to SCC3 at bits 14
 // to 12, WEN and CEN.  The flag bits are written as 0.
 pub fn alert_bits(a: Ina3221Alert) -> Int
@@ -754,7 +815,9 @@ impl Ina3221Port for Ina3221I2c
 
 // An INA3221 on a board's I2C bus, with the shunt resistor of each of its
 // three channels, in micro-ohms.  A resistance that is not positive marks a
-// channel the board does not use.
+// channel the board does not use.  The resistances stay in `attach`: a plain
+// `self` holds no state the trait could set (planning page 3.5, rows 1 and
+// 44).
 pub @value
 struct Ina3221
     port: Ina3221I2c
@@ -832,10 +895,6 @@ impl Ina3221
     fn set_config(self, c: Ina3221Config) -> Bool [hw]
         config_write(self.port, c)
 
-    // Enables or disables one channel.
-    fn set_channel(self, ch: Int, on: Bool) -> Bool [hw]
-        channel_enable(self.port, ch, on)
-
     // Sets the averaging code, 0 to 7.
     fn set_averaging(self, code: Int) -> Bool [hw]
         averaging_write(self.port, code)
@@ -912,6 +971,19 @@ impl CurrentMonitor[hw] for Ina3221
     // enabled or when the part did not answer.
     fn mon_start(self) -> Int [hw]
         convert_start(self.port)
+
+    // Switches a channel's conversion on or off (`channel_enable`).
+    fn mon_set_enabled(self, ch: Int, on: Bool) -> Bool [hw]
+        channel_enable(self.port, ch, on)
+
+    // The critical limit (`AlertCurrentOver`) or the power-valid upper limit
+    // (`AlertBusOver`); see `alert_limit_set`.
+    fn mon_set_alert(self, ch: Int, what: MonAlert, limit: Int) -> Bool [hw]
+        alert_limit_set(self.port, shunt_of(self.shunt0, self.shunt1, self.shunt2, ch), ch, what, limit)
+
+    // The alert, ready and overflow bits of MASK/ENABLE.
+    fn mon_flags(self) -> Int [hw]
+        mon_flags_of(self.port)
 
 impl Identifiable[hw] for Ina3221
     // The die ID, 0x3220, after the manufacturer ID matched 0x5449.
